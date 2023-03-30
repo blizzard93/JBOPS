@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
@@ -41,6 +42,7 @@ Taultulli > Settings > Notification Agents > New Script > Script Arguments:
             --limit plays=3 --delay 60
             --killMessage 'Your message here.'
             --today
+            --sleep_hours
 
  Save
  Close
@@ -57,6 +59,8 @@ import os
 from plexapi.server import PlexServer
 from time import time as ttime
 from time import sleep
+
+import pickle                                   # new line, import pickle library to save time variable
 
 TAUTULLI_URL = ''
 TAUTULLI_APIKEY = ''
@@ -244,6 +248,180 @@ def terminate_session(session_id, message, notifier=None, username=None):
         sys.stderr.write(
             "Tautulli API 'terminate_session' request failed: {0}.".format(e))
         return None
+
+
+def arg_decoding(arg):
+    
+    return arg.decode(TAUTULLI_ENCODING).encode('UTF-8')
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Limiting Plex users by plays, watches, or total time from Tautulli.")
+    parser.add_argument('--jbop', required=True, choices=SELECTOR,
+                        help='Limit selector.\nChoices: (%(choices)s)')
+    parser.add_argument('--username', required=True,
+                        help='The username of the person streaming.')
+    parser.add_argument('--sessionId', required=True,
+                        help='The unique identifier for the stream.')
+    parser.add_argument('--notify', type=int,
+                        help='Notification Agent ID number to Agent to send '
+                             'notification.')
+    parser.add_argument('--limit', action='append', type=lambda kv: kv.split("="),
+                        help='The limit related to the limit selector chosen.')
+    parser.add_argument('--grandparent_rating_key', type=int,
+                        help='The unique identifier for the TV show or artist.')
+    parser.add_argument('--delay', type=int, default=60,
+                        help='The seconds to wait in order to deem user is active.')
+    parser.add_argument('--killMessage', nargs='+',
+                        help='Message to send to user whose stream is killed.')
+    parser.add_argument('--section', default=False, choices=lib_dict.keys(), metavar='',
+                        help='Space separated list of case sensitive names to process. Allowed names are: \n'
+                             '(choices: %(choices)s)')
+    parser.add_argument('--days', type=int, default=0, nargs='?',
+                        help='Search history limit. \n'
+                             'Default: %(default)s day(s) (today).')
+    parser.add_argument('--duration', type=int, default=0,
+                        help='Duration of item that triggered script agent.')
+    parser.add_argument('--sleep_hours', type=float, default=0,
+                        help='Hours to wait after the episode number <limit> before asking if user is sleeping.')
+
+    opts = parser.parse_args()
+
+    history_lst = []
+    total_limit = 0
+    total_jbop = 0
+    duration = 0
+    dates = []
+    delta = timedelta(days=opts.days)
+
+    for i in range(delta.days + 1):
+        day = TODAY + timedelta(days=-i)
+        dates.append(day.strftime('%Y-%m-%d'))
+
+    if opts.limit:
+        limit = dict(opts.limit)
+
+        for key, value in limit.items():
+            if key == 'days':
+                total_limit += int(value) * (24 * 60 * 60)
+            elif key == 'hours':
+                total_limit += int(value) * (60 * 60)
+            elif key == 'minutes':
+                total_limit += int(value) * 60
+            elif key == 'plays':
+                total_limit = int(value)
+
+    if not opts.sessionId:
+        sys.stderr.write("No sessionId provided! Is this synced content?\n")
+        sys.exit(1)
+
+    if opts.duration:
+        # If duration is used convert to seconds from minutes
+        duration = opts.duration * 60
+
+    if opts.killMessage:
+        message = ' '.join(opts.killMessage)
+    else:
+        message = ''
+
+    for date in dates:
+        if opts.section:
+            section_id = lib_dict[opts.section]
+            history = get_history(username=opts.username, section_id=section_id, start_date=date)
+        else:
+            history = get_history(username=opts.username, start_date=date)
+        history_lst.append(history)
+        
+    if opts.jbop == 'watch':
+        total_jbop = sum([data['watched_status'] for history in history_lst for data in history['data']])
+    if opts.jbop == 'time':
+        total_jbop = sum([data['duration'] for history in history_lst for data in history['data']])
+    if opts.jbop == 'plays':
+        total_jbop = sum([history['recordsFiltered'] for history in history_lst])
+
+    if total_jbop:
+        if total_jbop > total_limit:
+            print('Total {} ({}) is greater than limit ({}).'
+                  .format(opts.jbop, total_jbop, total_limit))
+            terminate_session(opts.sessionId, message, opts.notify, opts.username)
+        elif (duration + total_jbop) > total_limit:
+            interval = 60
+            start = 0
+            while (start + total_jbop) < total_limit:
+                if get_activity(opts.sessionId):
+                    sleep(interval)
+                    start += interval
+                else:
+                    print('Session; {} has been dropped. Stopping monitoring of stream.'.format(opts.sessionId))
+                    exit()
+
+            print('Total {} ({} + current item duration {}) is greater than limit ({}).'
+                  .format(opts.jbop, total_jbop, duration, total_limit))
+            terminate_session(opts.sessionId, message, opts.notify, opts.username)
+        else:
+            if duration:
+                print('Total {} ({} + current item duration {}) is less than limit ({}).'
+                      .format(opts.jbop, total_jbop, duration, total_limit))
+            else:
+                print('Total {} ({}) is less than limit ({}).'
+                      .format(opts.jbop, total_jbop, total_limit))
+    # todo-me need more flexibility for pulling history
+    # limit work requires gp_rating_key only? Needs more options.
+    if opts.jbop == 'limit' and opts.grandparent_rating_key:
+        ep_watched = []
+        stopped_time = []
+        for date in dates:
+            history_lst.append(get_history(username=opts.username, start_date=date))
+        # If message is not already defined use default message
+        if not message:
+            message = LIMIT_MESSAGE.format(delay=opts.delay)
+        for history in history_lst:
+            ep_watched += [data['watched_status'] for data in history['data']
+                          if data['grandparent_rating_key'] == opts.grandparent_rating_key and
+                          data['watched_status'] == 1]
+            
+            stopped_time += [data['stopped'] for data in history['data']
+                            if data['grandparent_rating_key'] == opts.grandparent_rating_key and
+                            data['watched_status'] == 1]
+            
+        # If show has no history for date range start at 0.
+        if not ep_watched:
+            ep_watched = 0
+        else:
+            ep_watched = sum(ep_watched)
+
+        # If show episode have not been stopped (completed?) then use current time.
+        # Last stopped time is needed to test against auto play timer
+        if not stopped_time:
+            stopped_time = unix_time
+        else:
+            stopped_time = stopped_time[0]
+
+        if '@' in opts.username:
+            filename = f"{opts.username.split('@')[0]}_last_time.pickle"            # if username is an email get only the name before the '@'
+        else:
+            filename = f"{opts.username}_last_time.pickle"
+
+
+        # with open(filename, 'wb') as handle:
+        #     pickle.dump(int(ttime()), handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+        if ep_watched >= total_limit:
+            try:
+                with open(filename, 'rb') as handle:                                    # after the limit has been reached get time variable from pickle file
+                    time_old = pickle.load(handle)
+            except:
+                time_old = 0
+
+            if int(ttime()) - time_old > opts.sleep_hours*60*60:                    # check if more than 1.5 hours have passed
+                print("{}'s limit is {} and has watched {} episodes of this show.".format(opts.username, total_limit, ep_watched))
+                with open(filename, 'wb') as handle:
+                    pickle.dump(int(ttime()), handle, protocol=pickle.HIGHEST_PROTOCOL)
+                terminate_session(opts.sessionId, message, opts.notify, opts.username)
+        else:
+            print("{}'s limit is {} but has only watched {} episodes of this show.".format(opts.username, total_limit, ep_watched))
+            
 
 
 def arg_decoding(arg):
